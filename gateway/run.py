@@ -964,6 +964,28 @@ def _trim_tool_progress_lines(lines: list[str], max_lines: int | None) -> list[s
     return list(lines[-cap:])
 
 
+def _append_tool_progress_line(progress_lines: list[str], msg: str, *, max_lines: int | None) -> None:
+    """Append a rendered tool-progress line and enforce the configured cap."""
+    progress_lines.append(msg)
+    progress_lines[:] = _trim_tool_progress_lines(progress_lines, max_lines)
+
+
+def _reset_tool_progress_state(
+    progress_lines: list[str],
+    last_progress_msg: list[str | None],
+    repeat_count: list[int],
+    *,
+    single_message: bool,
+) -> bool:
+    """Reset per-bubble tool-progress state unless single-message mode is enabled."""
+    if single_message:
+        return False
+    progress_lines[:] = []
+    last_progress_msg[0] = None
+    repeat_count[0] = 0
+    return True
+
+
 def _resolve_tool_progress_max_lines(user_config: dict, platform_key: str) -> int:
     """Resolve display.platforms.<platform>.tool_progress_max_lines, then global fallback."""
     display_cfg = user_config.get("display") or {}
@@ -13328,9 +13350,6 @@ class GatewayRunner:
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
-            def _cap_progress_lines() -> None:
-                progress_lines[:] = _trim_tool_progress_lines(progress_lines, progress_max_lines)
-
             async def _cleanup_progress_message() -> None:
                 nonlocal progress_msg_id, progress_msg_ids
                 if await _delete_tool_progress_messages(
@@ -13410,16 +13429,17 @@ class GatewayRunner:
                         # order. Mirrors GatewayStreamConsumer.on_segment_break
                         # on the content side. (Issue: tool + content
                         # linearization regression after PR #7885.)
-                        if not progress_single_message:
+                        if _reset_tool_progress_state(
+                            progress_lines,
+                            last_progress_msg,
+                            repeat_count,
+                            single_message=progress_single_message,
+                        ):
                             progress_msg_id = None
-                            progress_lines = []
-                            last_progress_msg[0] = None
-                            repeat_count[0] = 0
                         continue
                     else:
                         msg = raw
-                        progress_lines.append(msg)
-                        _cap_progress_lines()
+                        _append_tool_progress_line(progress_lines, msg, max_lines=progress_max_lines)
 
                     # Throttle edits: batch rapid tool updates into fewer
                     # API calls to avoid hitting Telegram flood control.
@@ -13491,24 +13511,25 @@ class GatewayRunner:
                                 # Content-bubble marker during drain: close off
                                 # the current progress bubble and start a fresh
                                 # one for any tool lines that arrived after.
-                                if not progress_single_message:
-                                    if can_edit and progress_lines and progress_msg_id:
-                                        _pending_text = "\n".join(progress_lines)
-                                        try:
-                                            await adapter.edit_message(
-                                                chat_id=source.chat_id,
-                                                message_id=progress_msg_id,
-                                                content=_pending_text,
-                                            )
-                                        except Exception:
-                                            pass
+                                if not progress_single_message and can_edit and progress_lines and progress_msg_id:
+                                    _pending_text = "\n".join(progress_lines)
+                                    try:
+                                        await adapter.edit_message(
+                                            chat_id=source.chat_id,
+                                            message_id=progress_msg_id,
+                                            content=_pending_text,
+                                        )
+                                    except Exception:
+                                        pass
+                                if _reset_tool_progress_state(
+                                    progress_lines,
+                                    last_progress_msg,
+                                    repeat_count,
+                                    single_message=progress_single_message,
+                                ):
                                     progress_msg_id = None
-                                    progress_lines = []
-                                    last_progress_msg[0] = None
-                                    repeat_count[0] = 0
                             else:
-                                progress_lines.append(raw)
-                                _cap_progress_lines()
+                                _append_tool_progress_line(progress_lines, raw, max_lines=progress_max_lines)
                         except Exception:
                             break
                     # Final edit with all remaining tools (only if editing works)

@@ -7,6 +7,7 @@ from gateway.run import (
     _delete_tool_progress_message,
     _delete_tool_progress_messages,
     _finish_tool_progress_task,
+    _reset_tool_progress_state,
     _resolve_tool_progress_cleanup,
 )
 
@@ -41,6 +42,47 @@ def test_tool_progress_cleanup_defaults_to_disabled_for_invalid_values():
     config = {"display": {"platforms": {"telegram": {"tool_progress_cleanup": "junk"}}}}
 
     assert _resolve_tool_progress_cleanup(config, "telegram") is False
+
+
+@pytest.mark.parametrize("mode", ["new", "all", "verbose"])
+@pytest.mark.parametrize("single_message", [False, True])
+def test_tool_progress_single_message_controls_reset_independent_of_progress_mode(mode, single_message):
+    progress_lines = [f"{mode}-first", f"{mode}-second"]
+    last_progress_msg = [f"{mode}-second"]
+    repeat_count = [3]
+
+    reset = _reset_tool_progress_state(
+        progress_lines,
+        last_progress_msg,
+        repeat_count,
+        single_message=single_message,
+    )
+
+    assert reset is (not single_message), mode
+    if single_message:
+        assert progress_lines == [f"{mode}-first", f"{mode}-second"]
+        assert last_progress_msg == [f"{mode}-second"]
+        assert repeat_count == [3]
+    else:
+        assert progress_lines == []
+        assert last_progress_msg == [None]
+        assert repeat_count == [0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["new", "all", "verbose"])
+async def test_tool_progress_cleanup_deletes_progress_messages_independent_of_progress_mode(mode):
+    adapter = _DeleteAdapter()
+
+    deleted = await _delete_tool_progress_messages(
+        adapter,
+        "chat-1",
+        [f"{mode}-msg-1", f"{mode}-msg-2"],
+        enabled=True,
+    )
+
+    assert deleted == 2
+    assert adapter.deleted == [("chat-1", f"{mode}-msg-1"), ("chat-1", f"{mode}-msg-2")]
 
 
 @pytest.mark.asyncio
