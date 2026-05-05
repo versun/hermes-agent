@@ -505,9 +505,11 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
     kb.init_db()
 
     # Stub web_server so _check_ws_token has a token to compare against.
+    import hermes_cli
     import types
     stub = types.SimpleNamespace(_SESSION_TOKEN="secret-xyz")
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
+    monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
 
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
@@ -557,6 +559,49 @@ def test_bulk_status_ready(client):
     ready = next(col for col in board["columns"] if col["name"] == "ready")
     ids = {t["id"] for t in ready["tasks"]}
     assert {a["id"], b["id"], c2["id"]}.issubset(ids)
+
+
+def test_bulk_status_done_forwards_completion_summary(client):
+    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [a["id"], b["id"]],
+            "status": "done",
+            "result": "DECIDED: ship it",
+            "summary": "DECIDED: ship it",
+            "metadata": {"source": "dashboard"},
+        },
+    )
+
+    assert r.status_code == 200
+    assert all(r["ok"] for r in r.json()["results"])
+    conn = kb.connect()
+    try:
+        for tid in (a["id"], b["id"]):
+            task = kb.get_task(conn, tid)
+            run = kb.latest_run(conn, tid)
+            assert task.status == "done"
+            assert task.result == "DECIDED: ship it"
+            assert run.summary == "DECIDED: ship it"
+            assert run.metadata == {"source": "dashboard"}
+    finally:
+        conn.close()
+
+
+def test_dashboard_done_actions_prompt_for_completion_summary():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text()
+
+    assert "withCompletionSummary" in bundle
+    assert "Completion summary" in bundle
+    assert "result: summary" in bundle
+    assert "body: JSON.stringify(patch)" in bundle
+    assert "body: JSON.stringify(finalPatch)" in bundle
 
 
 def test_bulk_archive(client):
