@@ -3,12 +3,12 @@ import queue
 
 import pytest
 
+from gateway.display_config import resolve_display_setting
 from gateway.run import (
     _delete_tool_progress_message,
     _delete_tool_progress_messages,
     _finish_tool_progress_task,
     _reset_tool_progress_state,
-    _resolve_tool_progress_cleanup,
 )
 
 
@@ -25,23 +25,23 @@ class _NoDeleteAdapter:
     pass
 
 
-def test_tool_progress_cleanup_prefers_platform_override():
+def test_cleanup_progress_prefers_platform_override():
     config = {
         "display": {
-            "tool_progress_cleanup": False,
+            "cleanup_progress": False,
             "platforms": {
-                "telegram": {"tool_progress_cleanup": True},
+                "telegram": {"cleanup_progress": True},
             },
         }
     }
 
-    assert _resolve_tool_progress_cleanup(config, "telegram") is True
+    assert resolve_display_setting(config, "telegram", "cleanup_progress") is True
 
 
-def test_tool_progress_cleanup_defaults_to_disabled_for_invalid_values():
-    config = {"display": {"platforms": {"telegram": {"tool_progress_cleanup": "junk"}}}}
+def test_cleanup_progress_defaults_to_disabled_for_invalid_values():
+    config = {"display": {"platforms": {"telegram": {"cleanup_progress": "junk"}}}}
 
-    assert _resolve_tool_progress_cleanup(config, "telegram") is False
+    assert resolve_display_setting(config, "telegram", "cleanup_progress") is False
 
 
 @pytest.mark.parametrize("mode", ["new", "all", "verbose"])
@@ -71,7 +71,7 @@ def test_tool_progress_single_message_controls_reset_independent_of_progress_mod
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["new", "all", "verbose"])
-async def test_tool_progress_cleanup_deletes_progress_messages_independent_of_progress_mode(mode):
+async def test_cleanup_progress_deletes_progress_messages_independent_of_progress_mode(mode):
     adapter = _DeleteAdapter()
 
     deleted = await _delete_tool_progress_messages(
