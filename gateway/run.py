@@ -847,115 +847,6 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
-def _trim_tool_progress_lines(lines: list[str], max_lines: int | None) -> list[str]:
-    """Return only the latest tool-progress lines when a positive cap is set."""
-    try:
-        cap = int(max_lines or 0)
-    except (TypeError, ValueError):
-        cap = 0
-    if cap <= 0 or len(lines) <= cap:
-        return list(lines)
-    return list(lines[-cap:])
-
-
-def _append_tool_progress_line(progress_lines: list[str], msg: str, *, max_lines: int | None) -> None:
-    """Append a rendered tool-progress line and enforce the configured cap."""
-    progress_lines.append(msg)
-    progress_lines[:] = _trim_tool_progress_lines(progress_lines, max_lines)
-
-
-def _reset_tool_progress_state(
-    progress_lines: list[str],
-    last_progress_msg: list[str | None],
-    repeat_count: list[int],
-    *,
-    single_message: bool,
-) -> bool:
-    """Reset per-bubble tool-progress state unless single-message mode is enabled."""
-    if single_message:
-        return False
-    progress_lines[:] = []
-    last_progress_msg[0] = None
-    repeat_count[0] = 0
-    return True
-
-
-def _resolve_tool_progress_max_lines(user_config: dict, platform_key: str) -> int:
-    """Resolve display.platforms.<platform>.tool_progress_max_lines, then global fallback."""
-    display_cfg = user_config.get("display") or {}
-    platforms = display_cfg.get("platforms") or {}
-    plat_cfg = platforms.get(platform_key) if isinstance(platforms, dict) else None
-    raw = None
-    if isinstance(plat_cfg, dict):
-        raw = plat_cfg.get("tool_progress_max_lines")
-    if raw is None:
-        raw = display_cfg.get("tool_progress_max_lines")
-    try:
-        return max(0, int(raw or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-async def _delete_tool_progress_message(adapter, chat_id: str, message_id: str | None, *, enabled: bool) -> bool:
-    """Best-effort deletion for a completed gateway tool-progress message."""
-    if not enabled or not adapter or not message_id:
-        return False
-    delete_fn = getattr(adapter, "delete_message", None)
-    if delete_fn is None:
-        return False
-    try:
-        deleted = bool(await delete_fn(chat_id=chat_id, message_id=message_id))
-        if deleted:
-            logger.info("tool-progress cleanup deleted message %s", message_id)
-        return deleted
-    except Exception as exc:
-        logger.debug("tool-progress cleanup failed for message %s: %s", message_id, exc)
-        return False
-
-
-async def _delete_tool_progress_messages(adapter, chat_id: str, message_ids: list[str], *, enabled: bool) -> int:
-    """Best-effort deletion for every temporary tool-progress message bubble."""
-    deleted = 0
-    seen = set()
-    for message_id in list(message_ids):
-        if not message_id or message_id in seen:
-            continue
-        seen.add(message_id)
-        if await _delete_tool_progress_message(adapter, chat_id, message_id, enabled=enabled):
-            deleted += 1
-    return deleted
-
-
-async def _finish_tool_progress_task(progress_task, progress_queue, *, timeout: float = 3.0) -> None:
-    """Ask the progress sender to drain and exit.
-
-    Cancelling the task first skips normal queue processing on some event-loop
-    interleavings, so completed runs use an explicit finish sentinel and only
-    fall back to cancellation if the sender does not exit promptly.
-    """
-    if not progress_task:
-        return
-    if progress_task.done():
-        return
-    if progress_queue is not None:
-        try:
-            progress_queue.put(("__finish__",))
-        except Exception:
-            pass
-    try:
-        await asyncio.wait_for(progress_task, timeout=timeout)
-        return
-    except asyncio.TimeoutError:
-        progress_task.cancel()
-    except asyncio.CancelledError:
-        progress_task.cancel()
-        raise
-    try:
-        await progress_task
-    except asyncio.CancelledError:
-        pass
-
-
 def _load_gateway_config() -> dict:
     """Load and parse ~/.hermes/config.yaml, returning {} on any error.
 
@@ -2011,6 +1902,59 @@ class GatewayRunner:
         if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
             depth += 1
         return depth
+
+    @staticmethod
+    def _is_goal_continuation_event(event_or_text: Any) -> bool:
+        """Return True for synthetic /goal continuation turns.
+
+        Goal continuations are normal queued user-role events, so pause/clear
+        must distinguish them from real user /queue messages before removing or
+        suppressing them.
+        """
+        text = getattr(event_or_text, "text", event_or_text) or ""
+        return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
+
+    def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
+        """Remove queued synthetic /goal continuations for one session.
+
+        User-issued /goal pause/clear can race with a continuation already
+        queued by the judge.  Remove only synthetic goal continuations while
+        preserving normal /queue and user follow-up events.
+        """
+        removed = 0
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if isinstance(pending_slot, dict):
+            pending_event = pending_slot.get(session_key)
+            if self._is_goal_continuation_event(pending_event):
+                pending_slot.pop(session_key, None)
+                removed += 1
+
+        queued_events = getattr(self, "_queued_events", None)
+        if isinstance(queued_events, dict):
+            overflow = queued_events.get(session_key) or []
+            if overflow:
+                kept = []
+                for queued_event in overflow:
+                    if self._is_goal_continuation_event(queued_event):
+                        removed += 1
+                    else:
+                        kept.append(queued_event)
+                if kept:
+                    queued_events[session_key] = kept
+                else:
+                    queued_events.pop(session_key, None)
+        return removed
+
+    def _goal_still_active_for_session(self, session_id: str) -> bool:
+        """Best-effort fresh DB check before running a queued continuation."""
+        if not session_id:
+            return False
+        try:
+            from hermes_cli.goals import GoalManager
+            return GoalManager(session_id=session_id).is_active()
+        except Exception as exc:
+            logger.debug("goal continuation: active-state recheck failed: %s", exc)
+            return False
 
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
@@ -5945,7 +5889,7 @@ class GatewayRunner:
                     except Exception:
                         session_entry = None
                     if session_entry is not None:
-                        self._post_turn_goal_continuation(
+                        await self._post_turn_goal_continuation(
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
@@ -7430,8 +7374,6 @@ class GatewayRunner:
         # Set session title if provided with /new <title>
         _title_arg = event.get_command_args().strip()
         _title_note = ""
-        sanitized = None
-        title_set = False
         if _title_arg and self._session_db and new_entry:
             from hermes_state import SessionDB
             try:
@@ -7441,16 +7383,12 @@ class GatewayRunner:
                 _title_note = f"\n⚠️ Title rejected: {e}"
             if sanitized:
                 try:
-                    title_set = self._session_db.set_session_title(new_entry.session_id, sanitized)
-                    if title_set:
-                        header = f"✨ New session started: {sanitized}"
-                    else:
-                        _title_note = "\n⚠️ Session title could not be stored — session started untitled."
+                    self._session_db.set_session_title(new_entry.session_id, sanitized)
+                    header = f"✨ New session started: {sanitized}"
                 except ValueError as e:
                     _title_note = f"\n⚠️ {e} — session started untitled."
                 except Exception:
-                    logger.debug("Failed to set session title after /new", exc_info=True)
-                    _title_note = "\n⚠️ Session title could not be stored — session started untitled."
+                    pass
             elif not _title_note:
                 # sanitize_title returned empty (whitespace-only / unprintable)
                 _title_note = "\n⚠️ Title is empty after cleanup — session started untitled."
@@ -7466,13 +7404,6 @@ class GatewayRunner:
                 self._record_telegram_topic_binding(source, new_entry)
             except Exception:
                 logger.debug("Failed to rebind Telegram topic after /new", exc_info=True)
-
-        if _title_arg and sanitized and title_set and new_entry is not None:
-            await self._rename_telegram_topic_for_session_title(
-                source,
-                new_entry.session_id,
-                sanitized,
-            )
 
         # Fire plugin on_session_reset hook (new session guaranteed to exist)
         try:
@@ -8526,6 +8457,13 @@ class GatewayRunner:
             state = mgr.pause(reason="user-paused")
             if state is None:
                 return "No goal set."
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("goal pause: pending continuation cleanup failed: %s", exc)
             return f"⏸ Goal paused: {state.goal}"
 
         if lower == "resume":
@@ -8540,6 +8478,13 @@ class GatewayRunner:
         if lower in ("clear", "stop", "done"):
             had = mgr.has_goal()
             mgr.clear()
+            try:
+                adapter = self.adapters.get(event.source.platform) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
+                if adapter and _quick_key:
+                    self._clear_goal_pending_continuations(_quick_key, adapter)
+            except Exception as exc:
+                logger.debug("goal clear: pending continuation cleanup failed: %s", exc)
             return t("gateway.goal_cleared") if had else t("gateway.no_active_goal")
 
         # Otherwise — treat the remaining text as the new goal.
@@ -8571,7 +8516,69 @@ class GatewayRunner:
             "Controls: /goal status · /goal pause · /goal resume · /goal clear"
         )
 
-    def _post_turn_goal_continuation(
+    async def _send_goal_status_notice(self, source: Any, message: str) -> None:
+        """Send a /goal judge status line back to the originating chat/thread."""
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.debug("goal continuation: no adapter for %s", getattr(source, "platform", None))
+            return
+
+        try:
+            metadata = self._thread_metadata_for_source(source)
+        except Exception:
+            metadata = {"thread_id": source.thread_id} if getattr(source, "thread_id", None) else None
+
+        result = await adapter.send(source.chat_id, message, metadata=metadata)
+        if result is not None and not getattr(result, "success", True):
+            logger.warning(
+                "goal continuation: status send failed: %s",
+                getattr(result, "error", "unknown error"),
+            )
+
+    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+        """Send a /goal status line after the main response is delivered.
+
+        The gateway message handler returns the agent response to the platform
+        adapter, which sends it after this method's caller has returned.  For a
+        natural Discord/Telegram reading order, goal status belongs after that
+        send.  Platform adapters provide a one-shot post-delivery callback for
+        exactly this boundary; when unavailable, fall back to direct awaited
+        delivery rather than silently dropping the notice.
+        """
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.debug("goal continuation: no adapter for %s", getattr(source, "platform", None))
+            return
+
+        async def _deliver() -> None:
+            try:
+                await self._send_goal_status_notice(source, message)
+            except Exception as exc:
+                logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
+
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception:
+            session_key = None
+
+        if session_key and hasattr(adapter, "register_post_delivery_callback"):
+            try:
+                generation = None
+                active = getattr(adapter, "_active_sessions", {}).get(session_key)
+                if active is not None:
+                    generation = getattr(active, "_hermes_run_generation", None)
+                adapter.register_post_delivery_callback(
+                    session_key,
+                    _deliver,
+                    generation=generation,
+                )
+                return
+            except Exception as exc:
+                logger.debug("goal continuation: post-delivery callback registration failed: %s", exc)
+
+        await _deliver()
+
+    async def _post_turn_goal_continuation(
         self,
         *,
         session_entry: Any,
@@ -8607,38 +8614,14 @@ class GatewayRunner:
         decision = mgr.evaluate_after_turn(final_response or "", user_initiated=True)
         msg = decision.get("message") or ""
 
-        # Send the status line back to the user so they see the judge's
-        # verdict. Fire-and-forget via the adapter's ``send()`` method —
-        # adapters expose ``send(chat_id, content, reply_to, metadata)``,
-        # not a ``send_message(source, msg)`` wrapper, so an earlier
-        # ``hasattr(adapter, "send_message")`` gate here was dead code and
-        # users never saw ``✓ Goal achieved`` / ``⏸ budget exhausted``
-        # verdicts.
+        # Defer the status line until after the adapter has delivered the
+        # agent's visible final response. The judge runs after the response is
+        # produced but before BasePlatformAdapter sends it, so sending here
+        # would show "✓ Goal achieved" before the answer itself. Registering
+        # an awaited post-delivery callback preserves delivery reliability
+        # without reversing the user-visible ordering.
         if msg and source is not None:
-            try:
-                adapter = self.adapters.get(source.platform)
-                if adapter is not None and hasattr(adapter, "send"):
-                    import asyncio as _asyncio
-                    thread_meta = (
-                        {"thread_id": source.thread_id} if source.thread_id else None
-                    )
-                    coro = adapter.send(
-                        chat_id=source.chat_id,
-                        content=msg,
-                        metadata=thread_meta,
-                    )
-                    if _asyncio.iscoroutine(coro):
-                        try:
-                            loop = _asyncio.get_running_loop()
-                            loop.create_task(coro)
-                        except RuntimeError:
-                            # No running loop in this thread — best effort.
-                            try:
-                                _asyncio.run(coro)
-                            except Exception:
-                                pass
-            except Exception as exc:
-                logger.debug("goal continuation: status send failed: %s", exc)
+            await self._defer_goal_status_notice_after_delivery(source, msg)
 
         if not decision.get("should_continue"):
             return
@@ -10051,7 +10034,7 @@ class GatewayRunner:
         session_id: str,
         title: str,
     ) -> None:
-        """Best-effort rename of a Telegram DM topic when a session title changes."""
+        """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
         if not self._is_telegram_topic_lane(source) or not source.chat_id or not source.thread_id:
             return
 
@@ -10480,11 +10463,6 @@ class GatewayRunner:
             # Set the title
             try:
                 if self._session_db.set_session_title(session_id, sanitized):
-                    await self._rename_telegram_topic_for_session_title(
-                        source,
-                        session_id,
-                        sanitized,
-                    )
                     return f"✏️ Session title set: **{sanitized}**"
                 else:
                     return "Session not found in database."
@@ -13225,15 +13203,6 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
-        progress_max_lines = _resolve_tool_progress_max_lines(user_config, platform_key)
-        progress_single_message = bool(
-            resolve_display_setting(
-                user_config,
-                platform_key,
-                "tool_progress_single_message",
-                False,
-            )
-        )
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
@@ -13425,30 +13394,9 @@ class GatewayRunner:
 
             progress_lines = []      # Accumulated tool lines
             progress_msg_id = None   # ID of the progress message to edit
-            progress_msg_ids = []    # All temporary progress bubbles sent during this run
             can_edit = True          # False once an edit fails (platform doesn't support it)
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
-
-            async def _cleanup_progress_message() -> None:
-                # Completed runs use upstream cleanup_progress: temporary bubbles
-                # are deleted after the final response lands via the
-                # post-delivery callback, not before. This helper only clears
-                # local editing state when the progress task is stopping.
-                nonlocal progress_msg_id, progress_msg_ids
-                progress_msg_id = None
-                progress_msg_ids = []
-
-            def _track_progress_send_result(result) -> None:
-                nonlocal progress_msg_id
-                if result.success and result.message_id:
-                    progress_msg_id = result.message_id
-                    if result.message_id not in progress_msg_ids:
-                        progress_msg_ids.append(result.message_id)
-                    if _cleanup_progress:
-                        _cleanup_id = str(result.message_id)
-                        if _cleanup_id not in _cleanup_msg_ids:
-                            _cleanup_msg_ids.append(_cleanup_id)
 
             while True:
                 try:
@@ -13458,7 +13406,6 @@ class GatewayRunner:
                                 progress_queue.get_nowait()
                             except Exception:
                                 break
-                        await _cleanup_progress_message()
                         return
 
                     raw = progress_queue.get_nowait()
@@ -13479,23 +13426,6 @@ class GatewayRunner:
                     except Exception:
                         pass
 
-                    # Explicit graceful shutdown: the run completed. Leave no
-                    # permanent tool-progress bubble behind when cleanup is
-                    # enabled; this is more reliable than depending on task
-                    # cancellation timing.
-                    if isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__finish__":
-                        if can_edit and progress_lines and progress_msg_id:
-                            try:
-                                await adapter.edit_message(
-                                    chat_id=source.chat_id,
-                                    message_id=progress_msg_id,
-                                    content="\n".join(progress_lines),
-                                )
-                            except Exception:
-                                pass
-                        await _cleanup_progress_message()
-                        return
-
                     # Handle dedup messages: update last line with repeat counter
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
@@ -13511,17 +13441,14 @@ class GatewayRunner:
                         # order. Mirrors GatewayStreamConsumer.on_segment_break
                         # on the content side. (Issue: tool + content
                         # linearization regression after PR #7885.)
-                        if _reset_tool_progress_state(
-                            progress_lines,
-                            last_progress_msg,
-                            repeat_count,
-                            single_message=progress_single_message,
-                        ):
-                            progress_msg_id = None
+                        progress_msg_id = None
+                        progress_lines = []
+                        last_progress_msg[0] = None
+                        repeat_count[0] = 0
                         continue
                     else:
                         msg = raw
-                        _append_tool_progress_line(progress_lines, msg, max_lines=progress_max_lines)
+                        progress_lines.append(msg)
 
                     # Throttle edits: batch rapid tool updates into fewer
                     # API calls to avoid hitting Telegram flood control.
@@ -13537,7 +13464,6 @@ class GatewayRunner:
                         continue
 
                     if not _run_still_current():
-                        await _cleanup_progress_message()
                         return
 
                     if can_edit and progress_msg_id is not None:
@@ -13559,13 +13485,18 @@ class GatewayRunner:
                                     adapter.name,
                                 )
                             can_edit = False
-                            result = await adapter.send(
+                            _flood_result = await adapter.send(
                                 chat_id=source.chat_id,
                                 content=msg,
                                 reply_to=_progress_reply_to,
                                 metadata=_progress_metadata,
                             )
-                            _track_progress_send_result(result)
+                            if (
+                                _cleanup_progress
+                                and getattr(_flood_result, "success", False)
+                                and getattr(_flood_result, "message_id", None)
+                            ):
+                                _cleanup_msg_ids.append(str(_flood_result.message_id))
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
@@ -13584,7 +13515,10 @@ class GatewayRunner:
                                 reply_to=_progress_reply_to,
                                 metadata=_progress_metadata,
                             )
-                        _track_progress_send_result(result)
+                        if result.success and result.message_id:
+                            progress_msg_id = result.message_id
+                            if _cleanup_progress:
+                                _cleanup_msg_ids.append(str(result.message_id))
 
                     _last_edit_ts = time.monotonic()
 
@@ -13608,7 +13542,7 @@ class GatewayRunner:
                                 # Content-bubble marker during drain: close off
                                 # the current progress bubble and start a fresh
                                 # one for any tool lines that arrived after.
-                                if not progress_single_message and can_edit and progress_lines and progress_msg_id:
+                                if can_edit and progress_lines and progress_msg_id:
                                     _pending_text = "\n".join(progress_lines)
                                     try:
                                         await adapter.edit_message(
@@ -13618,15 +13552,12 @@ class GatewayRunner:
                                         )
                                     except Exception:
                                         pass
-                                if _reset_tool_progress_state(
-                                    progress_lines,
-                                    last_progress_msg,
-                                    repeat_count,
-                                    single_message=progress_single_message,
-                                ):
-                                    progress_msg_id = None
+                                progress_msg_id = None
+                                progress_lines = []
+                                last_progress_msg[0] = None
+                                repeat_count[0] = 0
                             else:
-                                _append_tool_progress_line(progress_lines, raw, max_lines=progress_max_lines)
+                                progress_lines.append(raw)
                         except Exception:
                             break
                     # Final edit with all remaining tools (only if editing works)
@@ -13640,7 +13571,6 @@ class GatewayRunner:
                             )
                         except Exception:
                             pass
-                    await _cleanup_progress_message()
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
@@ -14943,14 +14873,18 @@ class GatewayRunner:
                         )
                         if callable(_bg_cb):
                             try:
-                                _bg_cb()
+                                _bg_result = _bg_cb()
+                                if inspect.isawaitable(_bg_result):
+                                    await _bg_result
                             except Exception:
                                 pass
                     elif adapter and hasattr(adapter, "_post_delivery_callbacks"):
                         _bg_cb = adapter._post_delivery_callbacks.pop(session_key, None)
                         if callable(_bg_cb):
                             try:
-                                _bg_cb()
+                                _bg_result = _bg_cb()
+                                if inspect.isawaitable(_bg_result):
+                                    await _bg_result
                             except Exception:
                                 pass
                 # else: interrupted — discard the interrupted response ("Operation
@@ -14964,6 +14898,12 @@ class GatewayRunner:
                 next_channel_prompt = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
+                    if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
+                        logger.info(
+                            "Discarding stale goal continuation for session %s — goal is no longer active",
+                            session_key or "?",
+                        )
+                        return result
                     next_message = await self._prepare_inbound_message_text(
                         event=pending_event,
                         source=next_source,
@@ -15000,19 +14940,9 @@ class GatewayRunner:
                     channel_prompt=next_channel_prompt,
                 )
         finally:
-            cleanup_cancelled = False
-            # Stop progress sender gracefully first so it can drain queued tool
-            # lines and delete the temporary progress message before the final
-            # reply is delivered. Falling straight to cancel races cleanup.
-            # If this parent task is cancelled during graceful cleanup, defer
-            # re-raising until critical sibling tasks and running-agent state
-            # have been cleaned up. Otherwise cancellation can strand monitors
-            # and leave the session marked busy.
+            # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
-                try:
-                    await _finish_tool_progress_task(progress_task, progress_queue)
-                except asyncio.CancelledError:
-                    cleanup_cancelled = True
+                progress_task.cancel()
             interrupt_monitor.cancel()
             _notify_task.cancel()
 
@@ -15048,8 +14978,6 @@ class GatewayRunner:
                         await task
                     except asyncio.CancelledError:
                         pass
-            if cleanup_cancelled:
-                raise asyncio.CancelledError
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).
